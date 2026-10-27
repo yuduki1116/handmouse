@@ -1,0 +1,539 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Generate project files
+        run: |
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'HM_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "dev.handmouse"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "dev.handmouse"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              androidResources { noCompress += listOf("task") }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-service:2.8.7")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("com.google.mediapipe:tasks-vision:0.10.21")
+          }
+          HM_EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'HM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
+              <application
+                  android:label="Hand Mouse"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".HandMouseService"
+                      android:exported="false"
+                      android:foregroundServiceType="camera" />
+
+                  <service
+                      android:name=".MouseAccessibilityService"
+                      android:exported="true"
+                      android:label="Hand Mouse"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          HM_EOF
+          mkdir -p $(dirname app/src/main/java/dev/handmouse/GestureController.kt)
+          cat > app/src/main/java/dev/handmouse/GestureController.kt <<'HM_EOF'
+          package dev.handmouse
+
+          import android.os.SystemClock
+          import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+          import kotlin.math.abs
+          import kotlin.math.hypot
+
+          /**
+           * 操作:
+           *  - 人差し指の付け根(5番)で カーソル移動 (指先だと摘んだ時にブレるため)
+           *  - 親指+人差し指をつまむ(短く) = タップ
+           *  - つまんだまま400ms以上 = ドラッグ
+           *  - ピース(人差し指+中指だけ立てる)して上下に動かす = スクロール
+           */
+          class GestureController {
+              private var has = false
+              private var sx = 0f
+              private var sy = 0f
+              private var pinching = false
+              private var dragging = false
+              private var pinchT = 0L
+              private var px = 0f
+              private var py = 0f
+              private var peaceOn = false
+              private var anchorY = 0f
+              private var lastScroll = 0L
+
+              fun update(lm: List<NormalizedLandmark>) {
+                  val a = MouseAccessibilityService.instance ?: return
+                  val (w, h) = a.screenSize()
+                  val now = SystemClock.uptimeMillis()
+
+                  fun d(i: Int, j: Int) = hypot(lm[i].x() - lm[j].x(), lm[i].y() - lm[j].y())
+                  val size = d(0, 9).coerceAtLeast(0.01f)
+
+                  // カメラ中央60%の範囲を画面全体に対応づける
+                  val tx = ((lm[5].x() - 0.2f) / 0.6f).coerceIn(0f, 1f) * w
+                  val ty = ((lm[5].y() - 0.2f) / 0.6f).coerceIn(0f, 1f) * h
+                  if (!has) { sx = tx; sy = ty; has = true } else { sx += (tx - sx) * 0.35f; sy += (ty - sy) * 0.35f }
+                  a.setCursorVisible(true)
+
+                  // つまみ判定(ヒステリシス付き)
+                  val ratio = d(4, 8) / size
+                  if (!pinching && ratio < 0.30f) {
+                      pinching = true; pinchT = now; px = sx; py = sy
+                  } else if (pinching && ratio > 0.45f) {
+                      pinching = false
+                      if (dragging) { a.dragEnd(); dragging = false }
+                      else if (now - pinchT < 400) a.tap(px, py)
+                  }
+                  if (pinching && !dragging && now - pinchT >= 400) { dragging = true; a.dragStart(sx, sy) }
+                  if (dragging) a.dragMove(sx, sy)
+
+                  // ピース判定
+                  fun ext(t: Int, p: Int) = d(0, t) > d(0, p) * 1.1f
+                  val peace = !pinching && ext(8, 6) && ext(12, 10) && !ext(16, 14) && !ext(20, 18)
+                  if (peace) {
+                      if (!peaceOn) { peaceOn = true; anchorY = lm[9].y() }
+                      else {
+                          val dy = lm[9].y() - anchorY
+                          if (abs(dy) > 0.06f && now - lastScroll > 350) {
+                              a.scroll(contentDown = dy < 0) // 手を上げる→下へスクロール
+                              anchorY = lm[9].y(); lastScroll = now
+                          }
+                      }
+                  } else peaceOn = false
+
+                  a.moveCursor(sx, sy, pinching)
+              }
+
+              fun lost() {
+                  val a = MouseAccessibilityService.instance
+                  if (dragging) a?.dragEnd()
+                  dragging = false; pinching = false; peaceOn = false; has = false
+                  a?.setCursorVisible(false)
+              }
+          }
+          HM_EOF
+          mkdir -p $(dirname app/src/main/java/dev/handmouse/HandMouseService.kt)
+          cat > app/src/main/java/dev/handmouse/HandMouseService.kt <<'HM_EOF'
+          package dev.handmouse
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Matrix
+          import android.os.SystemClock
+          import android.util.Size
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.ImageProxy
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.LifecycleService
+          import com.google.mediapipe.framework.image.BitmapImageBuilder
+          import com.google.mediapipe.tasks.core.BaseOptions
+          import com.google.mediapipe.tasks.vision.core.RunningMode
+          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+          import java.util.concurrent.ExecutorService
+          import java.util.concurrent.Executors
+
+          class HandMouseService : LifecycleService() {
+
+              private lateinit var executor: ExecutorService
+              private var landmarker: HandLandmarker? = null
+              private val controller = GestureController()
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("handmouse", "Hand Mouse", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "handmouse")
+                      .setContentTitle("Hand Mouse 動作中")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .build()
+                  ServiceCompat.startForeground(this, 1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+
+                  executor = Executors.newSingleThreadExecutor()
+                  val base = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build()
+                  val opts = HandLandmarker.HandLandmarkerOptions.builder()
+                      .setBaseOptions(base)
+                      .setRunningMode(RunningMode.VIDEO)
+                      .setNumHands(1)
+                      .setMinHandDetectionConfidence(0.5f)
+                      .setMinTrackingConfidence(0.5f)
+                      .build()
+                  landmarker = HandLandmarker.createFromOptions(this, opts)
+
+                  val fut = ProcessCameraProvider.getInstance(this)
+                  fut.addListener({
+                      val provider = fut.get()
+                      @Suppress("DEPRECATION")
+                      val analysis = ImageAnalysis.Builder()
+                          .setTargetResolution(Size(640, 480))
+                          .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                          .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                          .build()
+                      analysis.setAnalyzer(executor, ::analyze)
+                      provider.unbindAll()
+                      provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun analyze(proxy: ImageProxy) {
+                  try {
+                      val bmp = proxy.toBitmap()
+                      val m = Matrix().apply {
+                          postRotate(proxy.imageInfo.rotationDegrees.toFloat())
+                          postScale(-1f, 1f) // フロントカメラは鏡像にする
+                      }
+                      val rotated = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                      val res = landmarker?.detectForVideo(BitmapImageBuilder(rotated).build(), SystemClock.uptimeMillis())
+                      val hands = res?.landmarks()
+                      if (hands.isNullOrEmpty()) controller.lost() else controller.update(hands[0])
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  } finally {
+                      proxy.close()
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  super.onStartCommand(intent, flags, startId)
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  controller.lost()
+                  landmarker?.close()
+                  executor.shutdown()
+                  super.onDestroy()
+              }
+          }
+          HM_EOF
+          mkdir -p $(dirname app/src/main/java/dev/handmouse/MainActivity.kt)
+          cat > app/src/main/java/dev/handmouse/MainActivity.kt <<'HM_EOF'
+          package dev.handmouse
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var toggle: Button
+              private var running = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  root.addView(TextView(this).apply { text = "Hand Mouse"; textSize = 28f })
+                  root.addView(TextView(this).apply {
+                      text = "\n① アクセシビリティで「Hand Mouse」をON\n② 開始を押す(カメラを許可)\n\n" +
+                          "・人差し指の付け根でカーソル移動\n・親指と人差し指をつまむ=タップ\n・つまんだまま長押し=ドラッグ\n" +
+                          "・ピースで上下に動かす=スクロール\n"
+                      textSize = 16f
+                  })
+                  root.addView(Button(this).apply {
+                      text = "アクセシビリティ設定を開く"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  toggle = Button(this).apply { setOnClickListener { onToggle() } }
+                  root.addView(toggle)
+                  status = TextView(this).apply { textSize = 14f; setPadding(0, pad, 0, 0) }
+                  root.addView(status)
+                  setContentView(root)
+              }
+
+              override fun onResume() { super.onResume(); refresh() }
+
+              private fun refresh() {
+                  toggle.text = if (running) "停止" else "開始"
+                  status.text = "アクセシビリティ: " + (if (MouseAccessibilityService.instance != null) "ON" else "OFF") +
+                      "\nトラッキング: " + (if (running) "動作中" else "停止中")
+              }
+
+              private fun onToggle() {
+                  if (running) {
+                      stopService(Intent(this, HandMouseService::class.java))
+                      running = false; refresh(); return
+                  }
+                  if (MouseAccessibilityService.instance == null) {
+                      Toast.makeText(this, "先にアクセシビリティをONにしてください", Toast.LENGTH_LONG).show(); return
+                  }
+                  if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.POST_NOTIFICATIONS), 1); return
+                  }
+                  ContextCompat.startForegroundService(this, Intent(this, HandMouseService::class.java))
+                  running = true; refresh()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, res)
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) onToggle()
+              }
+          }
+          HM_EOF
+          mkdir -p $(dirname app/src/main/java/dev/handmouse/MouseAccessibilityService.kt)
+          cat > app/src/main/java/dev/handmouse/MouseAccessibilityService.kt <<'HM_EOF'
+          package dev.handmouse
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+
+          class MouseAccessibilityService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var instance: MouseAccessibilityService? = null
+                  private const val CURSOR = 44
+              }
+
+              private lateinit var wm: WindowManager
+              private lateinit var lp: WindowManager.LayoutParams
+              private var cursor: View? = null
+              private val main = Handler(Looper.getMainLooper())
+
+              private var dragStroke: GestureDescription.StrokeDescription? = null
+              private var dragX = 0f
+              private var dragY = 0f
+              @Volatile private var dragBusy = false
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val v = View(this)
+                  v.background = GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(0x8800BFFF.toInt())
+                      setStroke(4, Color.WHITE)
+                  }
+                  lp = WindowManager.LayoutParams(
+                      CURSOR, CURSOR,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START }
+                  wm.addView(v, lp)
+                  cursor = v
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  instance = null
+                  cursor?.let { runCatching { wm.removeView(it) } }
+                  cursor = null
+                  super.onDestroy()
+              }
+
+              fun screenSize(): Pair<Float, Float> {
+                  val b = wm.currentWindowMetrics.bounds
+                  return Pair(b.width().toFloat(), b.height().toFloat())
+              }
+
+              fun moveCursor(x: Float, y: Float, pressed: Boolean) {
+                  main.post {
+                      val v = cursor ?: return@post
+                      lp.x = (x - CURSOR / 2).toInt()
+                      lp.y = (y - CURSOR / 2).toInt()
+                      (v.background as GradientDrawable).setColor(if (pressed) 0xCCFF4081.toInt() else 0x8800BFFF.toInt())
+                      runCatching { wm.updateViewLayout(v, lp) }
+                  }
+              }
+
+              fun setCursorVisible(visible: Boolean) {
+                  main.post { cursor?.visibility = if (visible) View.VISIBLE else View.INVISIBLE }
+              }
+
+              fun tap(x: Float, y: Float) {
+                  main.post {
+                      val p = Path().apply { moveTo(x, y) }
+                      val g = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(p, 0, 50)).build()
+                      dispatchGesture(g, null, null)
+                  }
+              }
+
+              fun scroll(contentDown: Boolean) {
+                  main.post {
+                      val (w, h) = screenSize()
+                      val p = Path().apply {
+                          if (contentDown) { moveTo(w / 2, h * 0.65f); lineTo(w / 2, h * 0.35f) }
+                          else { moveTo(w / 2, h * 0.35f); lineTo(w / 2, h * 0.65f) }
+                      }
+                      val g = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(p, 0, 220)).build()
+                      dispatchGesture(g, null, null)
+                  }
+              }
+
+              private val cb = object : GestureResultCallback() {
+                  override fun onCompleted(gestureDescription: GestureDescription?) { dragBusy = false }
+                  override fun onCancelled(gestureDescription: GestureDescription?) {
+                      dragBusy = false
+                      dragStroke = null
+                  }
+              }
+
+              fun dragStart(x: Float, y: Float) {
+                  main.post {
+                      val p = Path().apply { moveTo(x, y) }
+                      val s = GestureDescription.StrokeDescription(p, 0, 20, true)
+                      dragStroke = s; dragX = x; dragY = y; dragBusy = true
+                      dispatchGesture(GestureDescription.Builder().addStroke(s).build(), cb, null)
+                  }
+              }
+
+              fun dragMove(x: Float, y: Float) {
+                  main.post {
+                      val s0 = dragStroke ?: return@post
+                      if (dragBusy) return@post
+                      val p = Path().apply { moveTo(dragX, dragY); lineTo(x, y) }
+                      val s = s0.continueStroke(p, 0, 30, true)
+                      dragStroke = s; dragX = x; dragY = y; dragBusy = true
+                      dispatchGesture(GestureDescription.Builder().addStroke(s).build(), cb, null)
+                  }
+              }
+
+              fun dragEnd(retry: Int = 0) {
+                  main.post {
+                      val s0 = dragStroke ?: return@post
+                      if (dragBusy && retry < 20) { dragEnd(retry + 1); return@post }
+                      val p = Path().apply { moveTo(dragX, dragY) }
+                      val s = s0.continueStroke(p, 0, 10, false)
+                      dragStroke = null; dragBusy = true
+                      dispatchGesture(GestureDescription.Builder().addStroke(s).build(), cb, null)
+                  }
+              }
+          }
+          HM_EOF
+          mkdir -p $(dirname app/src/main/res/values/strings.xml)
+          cat > app/src/main/res/values/strings.xml <<'HM_EOF'
+          <resources>
+              <string name="a11y_desc">手の動きで画面をタップ・ドラッグ・スクロールするために使います。</string>
+          </resources>
+          HM_EOF
+          mkdir -p $(dirname app/src/main/res/xml/accessibility_service_config.xml)
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'HM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          HM_EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'HM_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          HM_EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'HM_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          kotlin.code.style=official
+          HM_EOF
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'HM_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "HandMouse"
+          include(":app")
+          HM_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.10.2 }
+      - name: Download hand landmarker model
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fL -o app/src/main/assets/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hand-mouse-android_v1
+          path: app/build/outputs/apk/debug/app-debug.apk
